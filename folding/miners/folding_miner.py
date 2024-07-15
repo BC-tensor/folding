@@ -5,6 +5,8 @@ import base64
 import concurrent.futures
 from typing import Dict, List, Tuple
 from collections import defaultdict
+
+import pandas as pd
 import bittensor as bt
 
 # import base miner class which takes care of most of the boilerplate
@@ -17,6 +19,8 @@ from folding.utils.ops import (
     get_tracebacks,
     calc_potential_from_edr,
 )
+
+from folding.store import PandasJobStore, MinerJob
 
 # root level directory for the project (I HATE THIS)
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -157,6 +161,7 @@ class FoldingMiner(BaseMinerNeuron):
         )  # remove one for safety
 
         self.mock = None
+        self.store = PandasJobStore(job_type=MinerJob)
 
     def create_default_dict(self):
         def nested_dict():
@@ -346,8 +351,7 @@ class FoldingMiner(BaseMinerNeuron):
 
         # Create the job and submit it to the executor
         simulation_manager = SimulationManager(
-            pdb_id=synapse.pdb_id,
-            output_dir=output_dir,
+            pdb_id=synapse.pdb_id, output_dir=output_dir, store=self.store
         )
 
         future = self.executor.submit(
@@ -415,13 +419,24 @@ class FoldingMiner(BaseMinerNeuron):
 
 
 class SimulationManager:
-    def __init__(self, pdb_id: str, output_dir: str) -> None:
+    def __init__(self, pdb_id: str, output_dir: str, store: PandasJobStore) -> None:
         self.pdb_id = pdb_id
+        self.store = store
         self.state: str = None
         self.state_file_name = f"{pdb_id}_state.txt"
 
         self.output_dir = output_dir
         self.start_time = time.time()
+
+        # Insert the MinerJob into the store.
+        self.store.insert(
+            pdb=pdb_id,
+            ff=None,
+            box=None,
+            water=None,
+            hotkeys=["fake_hotkey"],
+            epsilon=0.0,
+        )
 
     def create_empty_file(self, file_path: str):
         # For mocking
@@ -459,9 +474,8 @@ class SimulationManager:
                 file.write(content)
 
         for state, commands in commands.items():
-            bt.logging.info(f"Running {state} commands")
-            with open(self.state_file_name, "w") as f:
-                f.write(f"{state}\n")
+            self.job.update(state=state)
+            self.store.update(self.job)
 
             run_cmd_commands(
                 commands=commands, suppress_cmd_output=suppress_cmd_output, verbose=True

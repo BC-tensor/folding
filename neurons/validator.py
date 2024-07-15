@@ -33,7 +33,7 @@ from folding.validators.forward import create_new_challenge, run_step
 from folding.validators.protein import Protein
 
 # import base validator class which takes care of most of the boilerplate
-from folding.store import Job
+from folding.store import ValidatorJob
 from folding.base.validator import BaseValidatorNeuron
 from folding.utils.logging import log_event
 
@@ -164,7 +164,7 @@ class Validator(BaseValidatorNeuron):
                     event=job_event,
                 )
 
-    def update_job(self, job: Job):
+    def update_job(self, job: ValidatorJob):
         """Updates the job status based on the event information
 
         TODO: we also need to remove hotkeys that have not participated for some time (dereg or similar)

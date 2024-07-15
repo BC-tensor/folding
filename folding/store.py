@@ -12,6 +12,139 @@ from dataclasses import dataclass, asdict
 DB_DIR = os.path.join(os.path.dirname(__file__), "db")
 
 
+@dataclass
+class Job:
+    pdb: str
+    ff: str
+    box: str
+    water: str
+    hotkeys: list
+    created_at: pd.Timestamp
+    updated_at: pd.Timestamp
+    epsilon: float = 5e3  # TODO: move to ValidatorJob?
+    active: bool = True
+
+    def to_dict(self):
+        return asdict(self)
+
+    def to_series(self):
+        data = asdict(self)
+        name = data.pop("pdb")
+        return pd.Series(data, name=name)
+
+    def to_frame(self):
+        return pd.DataFrame([self.to_series()])
+
+
+class ValidatorJob(Job):
+    best_loss: float = np.inf
+    best_loss_at: pd.Timestamp = pd.NaT
+    best_hotkey: str = None
+    commit_hash: str = None
+    gro_hash: str = None
+    update_interval: pd.Timedelta = pd.Timedelta(minutes=10)
+    updated_count: int = 0
+    max_time_no_improvement: pd.Timedelta = pd.Timedelta(minutes=60)
+    min_updates: int = 10
+    event: dict = None
+
+    def update(self, loss: float, hotkey: str, commit_hash: str, gro_hash: str):
+        """Updates the status of a job in the database. If the loss improves, the best loss, hotkey and hashes are updated."""
+
+        if hotkey not in self.hotkeys:
+            raise ValueError(f"Hotkey {hotkey!r} is not a valid choice")
+
+        self.updated_at = pd.Timestamp.now().floor("s")
+        self.updated_count += 1
+
+        if loss < self.best_loss - self.epsilon:
+            self.best_loss = loss
+            self.best_loss_at = pd.Timestamp.now().floor("s")
+            self.best_hotkey = hotkey
+            self.commit_hash = commit_hash
+            self.gro_hash = gro_hash
+        elif (  # if loss has been improved but not recently enough, trigger early stopping
+            pd.Timestamp.now().floor("s") - self.best_loss_at
+            > self.max_time_no_improvement
+            and self.updated_count >= self.min_updates
+        ):
+            self.active = False
+        elif (  # if loss has never been improved and the job has been running a long time, trigger early stopping
+            isinstance(
+                self.best_loss_at, pd._libs.tslibs.nattype.NaTType
+            )  # a best loss has not been assigned
+            and pd.Timestamp.now().floor("s") - self.created_at
+            > self.max_time_no_improvement  # the time since the last best loss is greater than the max allowed time
+        ):
+            self.active = False
+
+    def check_for_available_hotkeys(self, hotkeys: List[str]) -> bool:
+        """Checks the job's hotkeys to only include those that are still valid. This permanently removes hotkeys from a job. If no hotkeys are left, the job is set to inactive.
+
+        Returns:
+            bool : True if there are remaining hotkeys in the job, and False if there are none.
+        """
+
+        # Get the list of hotkeys that are still valid and set the attribute.
+        self.hotkeys = list(set(self.hotkeys) & set(hotkeys))
+
+        # If no hotkeys are left, set the job to inactive and return False
+        if not self.hotkeys:
+            self.active = False
+            return False
+
+        return True
+
+
+class MinerJob(Job):
+    query_count: int = 0
+    max_time_no_query: pd.Timedelta = ValidatorJob.max_time_no_improvement * 3
+
+    def update(self, state: str):
+        """Updates the status of a job in the database. If the query count is greater than the max allowed, the job is set to inactive."""
+        # TODO: Should we calculate energy on every update here?
+
+        self.query_count += 1
+        self.state = state
+        self.updated_at = pd.Timestamp.now().floor("s")
+
+
+class MockJob(Job):
+    def __init__(self, n_hotkeys=5, update_seconds=5, stop_after_seconds=10):
+        self.pdb = self._make_pdb()
+        self.ff = "charmm27"
+        self.box = "cubic"
+        self.water = "tip3p"
+        self.hotkeys = self._make_hotkeys(n_hotkeys)
+        self.created_at = (
+            pd.Timestamp.now().floor("s")
+            - pd.Timedelta(seconds=random.randint(0, 3600 * 24))
+        ).floor("s")
+        self.best_loss = random.random()
+        self.best_hotkey = random.choice(self.hotkeys)
+        self.commit_hash = self._make_commit_hash()
+        self.gro_hash = self._make_commit_hash()
+        self.update_interval = pd.Timedelta(seconds=update_seconds)
+        self.min_updates = 1
+        self.max_time_no_improvement = pd.Timedelta(seconds=stop_after_seconds)
+
+    @staticmethod
+    def _make_pdb():
+        return "".join(random.choices(string.digits + string.ascii_lowercase, k=4))
+
+    @staticmethod
+    def _make_hotkeys(n=10, length=8):
+        return [MockJob._make_hotkey(length) for _ in range(n)]
+
+    @staticmethod
+    def _make_hotkey(length=8):
+        return "".join(random.choices(string.digits + string.ascii_letters, k=length))
+
+    @staticmethod
+    def _make_commit_hash(k=40):
+        return "".join(random.choices(string.digits + string.ascii_letters, k=k))
+
+
 class PandasJobStore:
     """Basic csv-based job store using pandas."""
 
@@ -32,12 +165,19 @@ class PandasJobStore:
         "event": "object",
     }
 
-    def __init__(self, db_path=DB_DIR, table_name="protein_jobs", force_create=False):
+    def __init__(
+        self,
+        db_path=DB_DIR,
+        table_name="protein_jobs",
+        job_type: Job = ValidatorJob,
+        force_create=False,
+    ):
         self.db_path = db_path
         self.table_name = table_name
         self.file_path = os.path.join(self.db_path, f"{self.table_name}.csv")
 
         self._db = self.load_table(force_create=force_create)
+        self.job_type = job_type
 
     def __repr__(self):
         """Just shows the underlying DataFrame."""
@@ -84,7 +224,7 @@ class PandasJobStore:
 
         queue = Queue()
         for pdb, row in jobs.iterrows():
-            queue.put(Job(pdb=pdb, **row.to_dict()))
+            queue.put(self.job_type(pdb=pdb, **row.to_dict()))
 
         return queue
 
@@ -103,7 +243,7 @@ class PandasJobStore:
         if pdb in self._db.index.tolist():
             raise ValueError(f"pdb {pdb!r} is already in the store")
 
-        job = Job(
+        job: Job = self.job_type(
             pdb=pdb,
             ff=ff,
             box=box,
@@ -132,122 +272,3 @@ class PandasJobStore:
 
         self._db.update(job_to_update)
         self.write()
-
-
-@dataclass
-class Job:
-    # TODO: inherit from pydantic BaseModel which should take care of dtypes and mutation
-
-    pdb: str
-    ff: str
-    box: str
-    water: str
-    hotkeys: list
-    created_at: pd.Timestamp
-    updated_at: pd.Timestamp
-    active: bool = True
-    best_loss: float = np.inf
-    best_loss_at: pd.Timestamp = pd.NaT
-    best_hotkey: str = None
-    commit_hash: str = None
-    gro_hash: str = None
-    update_interval: pd.Timedelta = pd.Timedelta(minutes=10)
-    updated_count: int = 0
-    max_time_no_improvement: pd.Timedelta = pd.Timedelta(minutes=60)
-    min_updates: int = 10
-    epsilon: float = 5e3
-    event: dict = None
-
-    def to_dict(self):
-        return asdict(self)
-
-    def to_series(self):
-        data = asdict(self)
-        name = data.pop("pdb")
-        return pd.Series(data, name=name)
-
-    def to_frame(self):
-        return pd.DataFrame([self.to_series()])
-
-    def update(self, loss: float, hotkey: str, commit_hash: str, gro_hash: str):
-        """Updates the status of a job in the database. If the loss improves, the best loss, hotkey and hashes are updated."""
-
-        if hotkey not in self.hotkeys:
-            raise ValueError(f"Hotkey {hotkey!r} is not a valid choice")
-
-        self.updated_at = pd.Timestamp.now().floor("s")
-        self.updated_count += 1
-
-        if loss < self.best_loss - self.epsilon:
-            self.best_loss = loss
-            self.best_loss_at = pd.Timestamp.now().floor("s")
-            self.best_hotkey = hotkey
-            self.commit_hash = commit_hash
-            self.gro_hash = gro_hash
-        elif (  # if loss has been improved but not recently enough, trigger early stopping
-            pd.Timestamp.now().floor("s") - self.best_loss_at
-            > self.max_time_no_improvement
-            and self.updated_count >= self.min_updates
-        ):
-            self.active = False
-        elif (  # if loss has never been improved and the job has been running a long time, trigger early stopping
-            isinstance(
-                self.best_loss_at, pd._libs.tslibs.nattype.NaTType
-            )  # a best loss has not been assigned
-            and pd.Timestamp.now().floor("s") - self.created_at
-            > self.max_time_no_improvement  # the time since the last best loss is greater than the max allowed time
-        ):
-            self.active = False
-
-    def check_for_available_hotkeys(self, hotkeys: List[str]) -> bool:
-        """Checks the job's hotkeys to only include those that are still valid. This permanently removes hotkeys from a job. If no hotkeys are left, the job is set to inactive.
-        
-        Returns:
-            bool : True if there are remaining hotkeys in the job, and False if there are none.
-        """
-
-        # Get the list of hotkeys that are still valid and set the attribute.
-        self.hotkeys = list(set(self.hotkeys) & set(hotkeys))
-
-        # If no hotkeys are left, set the job to inactive and return False
-        if not self.hotkeys:
-            self.active = False
-            return False
-
-        return True
-
-
-class MockJob(Job):
-    def __init__(self, n_hotkeys=5, update_seconds=5, stop_after_seconds=10):
-        self.pdb = self._make_pdb()
-        self.ff = "charmm27"
-        self.box = "cubic"
-        self.water = "tip3p"
-        self.hotkeys = self._make_hotkeys(n_hotkeys)
-        self.created_at = (
-            pd.Timestamp.now().floor("s")
-            - pd.Timedelta(seconds=random.randint(0, 3600 * 24))
-        ).floor("s")
-        self.best_loss = random.random()
-        self.best_hotkey = random.choice(self.hotkeys)
-        self.commit_hash = self._make_commit_hash()
-        self.gro_hash = self._make_commit_hash()
-        self.update_interval = pd.Timedelta(seconds=update_seconds)
-        self.min_updates = 1
-        self.max_time_no_improvement = pd.Timedelta(seconds=stop_after_seconds)
-
-    @staticmethod
-    def _make_pdb():
-        return "".join(random.choices(string.digits + string.ascii_lowercase, k=4))
-
-    @staticmethod
-    def _make_hotkeys(n=10, length=8):
-        return [MockJob._make_hotkey(length) for _ in range(n)]
-
-    @staticmethod
-    def _make_hotkey(length=8):
-        return "".join(random.choices(string.digits + string.ascii_letters, k=length))
-
-    @staticmethod
-    def _make_commit_hash(k=40):
-        return "".join(random.choices(string.digits + string.ascii_letters, k=k))
